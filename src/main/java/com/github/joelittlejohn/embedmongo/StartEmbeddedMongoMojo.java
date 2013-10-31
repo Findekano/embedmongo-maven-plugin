@@ -15,51 +15,37 @@
  */
 package com.github.joelittlejohn.embedmongo;
 
-import static java.util.Collections.*;
-
-import java.io.File;
-import java.io.IOException;
-import java.net.Authenticator;
-import java.net.InetSocketAddress;
-import java.net.PasswordAuthentication;
-import java.net.Proxy;
-import java.net.ProxySelector;
-import java.net.SocketAddress;
-import java.net.URI;
-import java.net.UnknownHostException;
-import java.util.List;
-import java.util.concurrent.TimeUnit;
-
-import org.apache.maven.plugin.AbstractMojo;
-import org.apache.maven.plugin.MojoExecutionException;
-import org.apache.maven.plugin.MojoFailureException;
-import org.apache.maven.project.MavenProject;
-
 import com.github.joelittlejohn.embedmongo.log.Loggers;
 import com.github.joelittlejohn.embedmongo.log.Loggers.LoggingStyle;
-
 import de.flapdoodle.embed.mongo.Command;
 import de.flapdoodle.embed.mongo.MongodExecutable;
 import de.flapdoodle.embed.mongo.MongodProcess;
 import de.flapdoodle.embed.mongo.MongodStarter;
-import de.flapdoodle.embed.mongo.config.AbstractMongoConfig.Net;
-import de.flapdoodle.embed.mongo.config.AbstractMongoConfig.Storage;
-import de.flapdoodle.embed.mongo.config.AbstractMongoConfig.Timeout;
-import de.flapdoodle.embed.mongo.config.ArtifactStoreBuilder;
-import de.flapdoodle.embed.mongo.config.DownloadConfigBuilder;
-import de.flapdoodle.embed.mongo.config.MongodConfig;
-import de.flapdoodle.embed.mongo.config.RuntimeConfigBuilder;
+import de.flapdoodle.embed.mongo.config.*;
+import de.flapdoodle.embed.mongo.distribution.IFeatureAwareVersion;
 import de.flapdoodle.embed.mongo.distribution.Version;
+import de.flapdoodle.embed.mongo.distribution.Versions;
 import de.flapdoodle.embed.process.config.IRuntimeConfig;
 import de.flapdoodle.embed.process.config.io.ProcessOutput;
 import de.flapdoodle.embed.process.config.store.IDownloadConfig;
 import de.flapdoodle.embed.process.distribution.Distribution;
-import de.flapdoodle.embed.process.distribution.GenericVersion;
 import de.flapdoodle.embed.process.distribution.IVersion;
 import de.flapdoodle.embed.process.exceptions.DistributionException;
 import de.flapdoodle.embed.process.runtime.ICommandLinePostProcessor;
 import de.flapdoodle.embed.process.runtime.Network;
 import de.flapdoodle.embed.process.store.IArtifactStore;
+import org.apache.maven.plugin.AbstractMojo;
+import org.apache.maven.plugin.MojoExecutionException;
+import org.apache.maven.plugin.MojoFailureException;
+import org.apache.maven.project.MavenProject;
+
+import java.io.File;
+import java.io.IOException;
+import java.net.*;
+import java.util.List;
+import java.util.concurrent.TimeUnit;
+
+import static java.util.Collections.singletonList;
 
 /**
  * When invoked, this goal starts an instance of mongo. The required binaries
@@ -74,7 +60,7 @@ public class StartEmbeddedMongoMojo extends AbstractMojo {
 
     private static final String PACKAGE_NAME = StartEmbeddedMongoMojo.class.getPackage().getName();
     public static final String MONGOD_CONTEXT_PROPERTY_NAME = PACKAGE_NAME + ".mongod";
-
+    public static final String MONGOD_EXE_CONTEXT_PROPERTY_NAME = PACKAGE_NAME + ".executable";
     /**
      * The port MongoDB should run on.
      * 
@@ -213,7 +199,7 @@ public class StartEmbeddedMongoMojo extends AbstractMojo {
             this.addProxySelector();
         }
 
-        MongodExecutable executable;
+        final MongodExecutable executable;
         try {
 
             final ICommandLinePostProcessor commandLinePostProcessor;
@@ -230,7 +216,7 @@ public class StartEmbeddedMongoMojo extends AbstractMojo {
                 commandLinePostProcessor = new ICommandLinePostProcessor.Noop();
             }
 
-            IRuntimeConfig runtimeConfig = new RuntimeConfigBuilder()
+            final IRuntimeConfig runtimeConfig = new RuntimeConfigBuilder()
                     .defaults(Command.MongoD)
                     .processOutput(getOutputConfig())
                     .artifactStore(getArtifactStore())
@@ -242,20 +228,23 @@ public class StartEmbeddedMongoMojo extends AbstractMojo {
             }
             savePortToProjectProperties();
 
-            MongodConfig mongoConfig = new MongodConfig(getVersion(),
-                    new Net(bindIp, port, Network.localhostIsIPv6()),
-                    new Storage(getDataDirectory(), null, 0),
-                    new Timeout());
+            final IMongodConfig mongoConfig = new MongodConfigBuilder()
+                    .version(getVersion())
+                    .net(new Net(bindIp, port, Network.localhostIsIPv6()))
+//                    .replication(new Storage(getDataDirectory(), null, 0))
+                    .build();
 
             executable = MongodStarter.getInstance(runtimeConfig).prepare(mongoConfig);
         } catch (UnknownHostException e) {
             throw new MojoExecutionException("Unable to determine if localhost is ipv6", e);
         } catch (DistributionException e) {
             throw new MojoExecutionException("Failed to download MongoDB distribution: " + e.withDistribution(), e);
+        } catch (IOException e) {
+            throw new MojoExecutionException("Failed to create MongoDB configuration: " + e);
         }
 
         try {
-            MongodProcess mongod = executable.start();
+            final MongodProcess mongod = executable.start();
 
             if (wait) {
                 while (true) {
@@ -268,6 +257,7 @@ public class StartEmbeddedMongoMojo extends AbstractMojo {
             }
 
             getPluginContext().put(MONGOD_CONTEXT_PROPERTY_NAME, mongod);
+            getPluginContext().put(MONGOD_EXE_CONTEXT_PROPERTY_NAME, executable);
         } catch (IOException e) {
             throw new MojoExecutionException("Unable to start the mongod", e);
         }
@@ -341,7 +331,7 @@ public class StartEmbeddedMongoMojo extends AbstractMojo {
         });
     }
 
-    private IVersion getVersion() {
+    private IFeatureAwareVersion getVersion() {
         String versionEnumName = this.version.toUpperCase().replaceAll("\\.", "_");
 
         if (versionEnumName.charAt(0) != 'V') {
@@ -351,8 +341,13 @@ public class StartEmbeddedMongoMojo extends AbstractMojo {
         try {
             return Version.valueOf(versionEnumName);
         } catch (IllegalArgumentException e) {
-            getLog().warn("Unrecognised MongoDB version '" + this.version + "', this might be a new version that we don't yet know about. Attemping download anyway...");
-            return new GenericVersion(this.version);
+            getLog().warn("Unrecognised MongoDB version '" + this.version + "', this might be a new version that we don't yet know about. Attempting download anyway...");
+            return Versions.withFeatures(new IVersion() {
+                @Override
+                public String asInDownloadPath() {
+                    return version;
+                }
+            });
         }
 
     }
